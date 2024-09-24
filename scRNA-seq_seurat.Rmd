@@ -1,0 +1,1501 @@
+---
+title: "Single Cell RNA-seq Seurat Pipeline - Seurat v4"
+output: html_document
+date: "2024-08-16"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+--------------------------------------------------------------------------------
+0. Load libraries and Set Directory Paths
+--------------------------------------------------------------------------------
+```{r}
+# Library path
+#.libPaths("/projectnb/farmer/akhila/R/x86_64-pc-linux-gnu-library")
+
+# Use Seurat v4.1.4 
+#remotes::install_version("SeuratObject", "4.1.4", repos = c("https://satijalab.r-universe.dev", getOption("repos")))
+```
+
+```{r}
+# Load libraries
+library(Seurat) 
+library(SoupX)
+library(dplyr)
+library(Matrix)
+library(ggplot2)
+library(biomaRt)
+library(tidyverse)
+library("clustree")
+library(AnnotationHub)
+library(ensembldb)
+library(future)
+library(future.apply)
+library(data.table)
+
+packageVersion("Seurat")
+```
+
+```{r}
+# Define sample names (folder names under base_dir containing the data files)
+conditions <- c(
+  "1D-GFP",
+  "1D-mCherry",
+  "1W-HFD.GFP", 
+  "1W-HFD.mCherry",
+  "2D-GFP",
+  "2D-mCherry",
+  "2W-HFD.GFP",
+  "2W-HFD.mCherry",
+  "3D-GFP",
+  "3D-mCherry",
+  "7D-GFP",
+  "7D-mCherry",
+  "RT-GFP",
+  "RT-mCherry"
+)
+
+# Define the base directory where the raw data is located
+raw_samples_dir <- "/project/farmer/alignment/"
+# Define the base directory where the filtered data is located
+filtered_samples_dir <- "/project/farmer/samples"
+# Define output directory 
+results_dir <- "/projectnb/farmer/akhila/Rabhi_Lab/scSPLiT-seq/final_results"
+```
+
+
+--------------------------------------------------------------------------------
+1. Obtain Cell Counts per Condition
+--------------------------------------------------------------------------------
+```{r}
+# Initialize a list to store cell counts for each condition
+cell_counts <- list()
+
+# Loop through each condition
+for (condition in conditions) {
+    # Define file paths
+    mtx_file <- file.path(filtered_samples_dir, paste0(condition, ".ScaleRNA.filtered.matrix/matrix.mtx"))
+    barcode_file <- file.path(filtered_samples_dir, paste0(condition, ".ScaleRNA.filtered.matrix/barcodes.tsv"))
+
+    # Load the matrix and barcodes
+    expr_matrix <- readMM(mtx_file)
+    barcodes <- fread(barcode_file, header = FALSE)
+
+    # Count the number of cells (number of columns in the matrix)
+    cell_counts[[condition]] <- ncol(expr_matrix)
+}
+
+# Print the number of cells for each condition
+print(cell_counts)
+```
+
+
+--------------------------------------------------------------------------------
+2. Remove Ambient RNA Using SoupX
+--------------------------------------------------------------------------------
+```{r}
+# Function to process one sample and remove ambient RNA
+process_condition <- function(condition, raw_samples_dir, filtered_samples_dir, results_dir) {
+  print(paste("Processing:", condition))
+  
+  # File paths for raw data
+  raw_matrix_path <- file.path(raw_samples_dir, paste0(condition, ".ScaleRNA/", condition, ".ScaleRNA.star.solo/GeneFull_Ex50pAS/raw/UniqueAndMult-PropUnique.mtx"))
+  raw_features_path <- file.path(raw_samples_dir, paste0(condition, ".ScaleRNA/", condition, ".ScaleRNA.star.solo/GeneFull_Ex50pAS/raw/features.tsv"))
+  raw_barcodes_path <- file.path(raw_samples_dir, paste0(condition, ".ScaleRNA/", condition, ".ScaleRNA.star.solo/GeneFull_Ex50pAS/raw/barcodes.tsv"))
+  
+  # File paths for filtered data
+  filtered_matrix_path <- file.path(filtered_samples_dir, paste0(condition, ".ScaleRNA.filtered.matrix/matrix.mtx"))
+  filtered_features_path <- file.path(filtered_samples_dir, paste0(condition, ".ScaleRNA.filtered.matrix/features.tsv"))
+  filtered_barcodes_path <- file.path(filtered_samples_dir, paste0(condition, ".ScaleRNA.filtered.matrix/barcodes.tsv"))
+  
+  # Load raw and filtered matrices
+  raw_matrix <- readMM(raw_matrix_path)
+  raw_matrix <- as.matrix(raw_matrix) # Convert to numeric matrix
+  filtered_matrix <- readMM(filtered_matrix_path)
+  filtered_matrix <- as.matrix(filtered_matrix) # Convert to numeric matrix
+  
+  # Load features and barcodes
+  raw_features <- read.table(raw_features_path, header = FALSE, stringsAsFactors = FALSE, sep = "\t")
+  raw_barcodes <- read.table(raw_barcodes_path, header = FALSE, stringsAsFactors = FALSE, sep = "\t")
+  
+  filtered_features <- read.table(filtered_features_path, header = FALSE, stringsAsFactors = FALSE, sep = "\t")
+  filtered_barcodes <- read.table(filtered_barcodes_path, header = FALSE, stringsAsFactors = FALSE, sep = "\t")
+  
+  # Check if the data is loaded correctly
+  print("Data is loaded.")
+  
+  # Identify and report duplicate gene names
+  duplicated_gene_names <- duplicated(filtered_features$V2)
+  num_duplicates <- sum(duplicated_gene_names)
+  duplicate_gene_rows <- filtered_features[duplicated_gene_names, ]
+  print(paste("Number of duplicate gene names:", num_duplicates))
+  print("Duplicate gene rows:")
+  print(duplicate_gene_rows)
+  
+  # Identify mitochondrial genes based on gene names
+  mito_gene_names <- grep("^mt-", filtered_features$V2, value = TRUE)
+  mito_gene_ids <- filtered_features$V1[filtered_features$V2 %in% mito_gene_names]
+  
+  # Set row and column names for raw and filtered matrices
+  rownames(raw_matrix) <- raw_features$V1
+  colnames(raw_matrix) <- raw_barcodes$V1
+  
+  rownames(filtered_matrix) <- filtered_features$V1
+  colnames(filtered_matrix) <- filtered_barcodes$V1
+
+  # Verify that column names are correctly assigned
+  if (is.null(colnames(raw_matrix)) || is.null(colnames(filtered_matrix))) {
+    stop("No cell names (colnames) present in the input matrix.")
+  }
+
+  # Verify that the number of barcodes matches the number of columns
+  if (length(colnames(raw_matrix)) != nrow(raw_barcodes)) {
+    stop("Mismatch between the number of barcodes and the number of columns in the raw matrix.")
+  }
+  if (length(colnames(filtered_matrix)) != nrow(filtered_barcodes)) {
+    stop("Mismatch between the number of barcodes and the number of columns in the filtered matrix.")
+  }
+
+  # Set toc and tod to the filtered and raw matrices
+  table_of_counts <- filtered_matrix
+  table_of_droplets <- raw_matrix
+  
+  # Initialize SoupChannel object
+  sc <- SoupChannel(table_of_droplets, table_of_counts, calcSoupProfile = FALSE)
+  print("SoupChannel object initialized.")
+  
+  # Estimate Soup expression object
+  sc <- estimateSoup(sc)
+  table_of_counts <- sc$toc
+  
+  # Create Seurat object
+  seurat_obj <- CreateSeuratObject(counts = table_of_counts, project = condition)
+  print("Seurat object is created.")
+  
+  #Set DefaultAssay to "RNA"
+  DefaultAssay(seurat_obj) <- "RNA"
+  print(DefaultAssay(seurat_obj))
+
+  # Adding percent.mt column to metadata for each Seurat object
+  seurat_obj[["percent.mt"]] <- PercentageFeatureSet(seurat_obj, features = mito_gene_ids)
+  print("Mitochondrial metadata added to Seurat object.")
+  
+  # Normalize and find variable features
+  seurat_obj <- NormalizeData(seurat_obj)
+  seurat_obj <- FindVariableFeatures(seurat_obj)
+  
+  # Scale data
+  seurat_obj <- ScaleData(seurat_obj)
+  
+  # Run PCA
+  seurat_obj <- RunPCA(seurat_obj, features = VariableFeatures(object = seurat_obj))
+  
+  # Find Neighbors and Clusters
+  seurat_obj <- FindNeighbors(seurat_obj, dims = 1:10)
+  seurat_obj <- FindClusters(seurat_obj)
+  
+  # Run UMAP
+  seurat_obj <- RunUMAP(seurat_obj, dims = 1:10)
+  
+  # Create the pre-SoupX UMAP plot and save it to a variable
+  umap_plot_before <- DimPlot(seurat_obj, group.by = "seurat_clusters")
+  
+  # Open PDF device
+  pdf(file = file.path(results_dir, "SoupX_UMAPs", paste0("UMAP_Before_SoupX_", condition, ".pdf")), width = 6, height = 6)
+
+  
+  # Print the plot to the PDF device
+  print(umap_plot_before)
+  
+  # Close PDF device
+  dev.off()
+  
+  # Add clusters and embeddings to SoupX object
+  meta <- seurat_obj@meta.data
+  umap <- seurat_obj@reductions$umap@cell.embeddings
+  sc <- setClusters(sc, setNames(meta$seurat_clusters, rownames(meta)))
+  sc <- setDR(sc, umap)
+  
+  # Estimate contamination and adjust counts
+  sc <- autoEstCont(sc)
+  adjusted_matrix <- adjustCounts(sc, roundToInt = TRUE)
+  print("Contamination estimated and matrix adjusted.")
+  
+  # Create a new Seurat object with adjusted counts
+  adjusted_seurat_obj <- CreateSeuratObject(counts = adjusted_matrix, project = condition)
+  DefaultAssay(adjusted_seurat_obj) <- "RNA"
+  print(DefaultAssay(adjusted_seurat_obj))
+  
+  # Adding percent.mt to the adjusted Seurat object
+  adjusted_seurat_obj[["percent.mt"]] <- PercentageFeatureSet(adjusted_seurat_obj, features = mito_gene_ids)
+  
+  # Normalize and find variable features for the adjusted Seurat object
+  adjusted_seurat_obj <- NormalizeData(adjusted_seurat_obj)
+  adjusted_seurat_obj <- FindVariableFeatures(adjusted_seurat_obj)
+  
+  # Scale data for the adjusted Seurat object
+  adjusted_seurat_obj <- ScaleData(adjusted_seurat_obj, verbose = TRUE)
+
+  # Run PCA for the adjusted Seurat object
+  adjusted_seurat_obj <- RunPCA(adjusted_seurat_obj, features = VariableFeatures(object = adjusted_seurat_obj))
+  
+  # Find Neighbors and Clusters for the adjusted Seurat object
+  adjusted_seurat_obj <- FindNeighbors(adjusted_seurat_obj, dims = 1:10)
+  adjusted_seurat_obj <- FindClusters(adjusted_seurat_obj)
+  
+  # Run UMAP for the adjusted Seurat object
+  adjusted_seurat_obj <- RunUMAP(adjusted_seurat_obj, dims = 1:10)
+  
+  # Create the post-SoupX UMAP plot and save it to a variable
+  umap_plot_after <- DimPlot(adjusted_seurat_obj, group.by = "seurat_clusters")
+  
+  # Open PDF device
+  pdf(file = file.path(results_dir, "SoupX_UMAPs", paste0("UMAP_After_SoupX_", condition, ".pdf")), width = 6, height = 6)
+
+  # Print the plot to the PDF device
+  print(umap_plot_after)
+  
+  # Close PDF device
+  dev.off()
+  
+  # Define the directories for saving the Seurat objects
+  original_dir <- file.path(results_dir, "original_seurat_objects")
+  adjusted_dir <- file.path(results_dir, "adjusted_seurat_objects")
+  
+  # Create the full paths for saving the Seurat objects
+  original_path <- file.path(original_dir, paste0(condition, "_original_seurat_obj.rds"))
+  adjusted_path <- file.path(adjusted_dir, paste0(condition, "_adjusted_seurat_obj.rds"))
+  
+  saveRDS(seurat_obj, file = original_path)
+  saveRDS(adjusted_seurat_obj, file = adjusted_path)
+  
+  return(list(original_path = original_path, adjusted_path = adjusted_path))
+}
+```
+
+```{r}
+# Loop through each condition and process
+for (condition in conditions) {
+  process_condition(condition, raw_samples_dir, filtered_samples_dir, results_dir)
+}
+```
+
+
+________________________________________________________________________________
+2. Load Data and Do Quality Control Using Seurat
+________________________________________________________________________________
+```{r}
+# Function to load the filtered data and perform quality control using Seurat
+perform_quality_control <- function(seurat_obj, condition, filtered_samples_dir, results_dir) {
+  
+  # Filtered features path
+  filtered_features_path <- file.path(filtered_samples_dir, paste0(condition, ".ScaleRNA.filtered.matrix/features.tsv"))
+  
+  # Load filtered matrices
+  filtered_features <- read.table(filtered_features_path, header = FALSE, stringsAsFactors = FALSE, sep = "\t")
+  
+  # Check if the data is loaded correctly
+  print("Data is loaded.")
+  
+  # # Identify mitochondrial genes based on gene names
+  # mito_gene_names <- grep("^mt-", filtered_features$V2, value = TRUE)
+  # mito_gene_ids <- filtered_features$V1[filtered_features$V2 %in% mito_gene_names]
+  # 
+  # # Ensure that percent.mt is not added again if it was already added in process_condition
+  # seurat_obj[["percent.mt"]] <- PercentageFeatureSet(seurat_obj, features = mito_gene_ids)
+  # print("Adding percent.mt to the adjusted Seurat object.")
+
+  cat("Starting quality control for", condition, "\n")
+  
+  # Check number of cells before filtering
+  cat(condition, " - Number of cells before filtering: ", ncol(seurat_obj), "\n")
+  
+  print(head(seurat_obj@meta.data))
+  print(colnames(seurat_obj@meta.data))
+  
+  # Generate Violin plots before filtering
+  before_plot <- VlnPlot(seurat_obj, group.by= "orig.ident", features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3, combine = FALSE)
+  combined_before_plots <- before_plot[[1]] + before_plot[[2]] + before_plot[[3]]
+  pdf(file = paste0(results_dir, "/violin_plots/", condition, "_violin_plot_before_QC.pdf"), width = 9, height = 3)
+  print(combined_before_plots)
+  dev.off()
+  
+  # Quality control
+  seurat_obj <- subset(seurat_obj, subset = nFeature_RNA > 200 & nFeature_RNA < 4000 & percent.mt < 5)
+  
+  # Check number of cells after filtering
+  cat(condition, " - Number of cells after filtering: ", ncol(seurat_obj), "\n")
+  
+  # Generate Violin plots after filtering
+  after_plot <- VlnPlot(seurat_obj, group.by= "orig.ident", features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3, combine = FALSE)
+  combined_after_plots <- after_plot[[1]] + after_plot[[2]] + after_plot[[3]]
+  pdf(file = paste0(results_dir, "/violin_plots/", condition, "_violin_plot_after_QC.pdf"), width = 9, height = 3)
+  print(combined_after_plots)
+  dev.off()
+  
+  cat("Finished quality control for", condition, "\n")
+  
+  # Save the QCed Seurat object
+  qc_seurat_path <- file.path(results_dir, "qc_seurat_objects", paste0(condition, "_after_QC.rds"))
+  saveRDS(seurat_obj, file = qc_seurat_path)
+  cat("QCed Seurat object saved:", qc_seurat_path, "\n")
+  
+  # Return the Seurat object after filtering
+  return(seurat_obj)
+}
+```
+
+```{r}
+# Adjusted seurat objects directory
+adjusted_seurat_dir <- file.path(results_dir, "adjusted_seurat_objects")
+
+# Apply perform_quality_control to each Seurat object in adjusted seurat object directory
+# Use the provided conditions to load and process each Seurat object
+qc_seurat_list <- lapply(conditions, function(condition) {
+  
+  # Construct the file path for each Seurat object based on the condition
+  seurat_file_path <- file.path(adjusted_seurat_dir, paste0(condition, "_adjusted_seurat_obj.rds"))
+  print(seurat_file_path)
+  
+  # Check if the file exists
+  if (file.exists(seurat_file_path)) {
+    # Load the adjusted Seurat object from the saved RDS file
+    adjusted_seurat_obj <- readRDS(seurat_file_path)
+    
+    # Perform quality control on the adjusted Seurat object
+    qc_adjusted <- perform_quality_control(adjusted_seurat_obj, condition, filtered_samples_dir, results_dir)
+    
+    # Return the adjusted Seurat object after QC
+    return(qc_adjusted)
+  } 
+  else {
+    cat("File does not exist for condition:", condition, "\n")
+    return(NULL)
+  }
+})
+
+# Set names of the list elements to match the conditions
+names(qc_seurat_list) <- conditions
+
+# Save the list of QCed Seurat objects for later use
+saveRDS(qc_seurat_list, file = file.path(results_dir, "qc_seurat_list.rds"))
+cat("QCed Seurat objects saved:", file.path(results_dir, "qc_seurat_list.rds"), "\n")
+
+```
+
+
+--------------------------------------------------------------------------------
+3. Add Metadata
+--------------------------------------------------------------------------------
+```{r}
+qc_seurat_list <- readRDS(file.path(results_dir, "qc_seurat_list.rds"))
+
+# Define environmental conditions corresponding to each sample
+environment <- c(
+  "Cold Exposure", 
+  "Cold Exposure", 
+  "High Fat Diet", 
+  "High Fat Diet",
+  "Cold Exposure", 
+  "Cold Exposure", 
+  "High Fat Diet", 
+  "High Fat Diet", 
+  "Cold Exposure", 
+  "Cold Exposure", 
+  "Cold Exposure", 
+  "Cold Exposure", 
+  "Room Temperature", 
+  "Room Temperature"
+)
+
+# Define diet information corresponding to each sample
+diet <- c(
+  "Normal Diet", 
+  "Normal Diet", 
+  "High Fat Diet", 
+  "High Fat Diet",
+  "Normal Diet", 
+  "Normal Diet",
+  "High Fat Diet", 
+  "High Fat Diet",
+  "Normal Diet", 
+  "Normal Diet", 
+  "Normal Diet", 
+  "Normal Diet",
+  "Normal Diet", 
+  "Normal Diet"
+)
+
+# Define days corresponding to each sample
+days <- c(
+  "1D", "1D", "1W", "1W", "2D", "2D", "2W", "2W", "3D", "3D", "7D", "7D", "RT", "RT" 
+)
+
+# Define color corresponding to each sample
+color <- c(
+  "GFP", "mCherry", "GFP", "mCherry", "GFP", "mCherry", "GFP", "mCherry",
+  "GFP", "mCherry", "GFP", "mCherry", "GFP", "mCherry"
+)
+
+# Add this metadata to the Seurat objects in a single loop
+for (i in seq_along(conditions)) {
+  # Add treatment names
+  condition <- conditions[i]
+  seurat_obj <- qc_seurat_list[[condition]]
+  
+  # Add metadata
+  seurat_obj$EnvironmentalCondition <- environment[i]
+  seurat_obj$Diet <- diet[i]
+  seurat_obj$Day <- days[i]
+  seurat_obj$Condition <- color[i]
+  
+  # Update the list with modified Seurat object
+  qc_seurat_list[[condition]] <- seurat_obj
+    
+  # Save each updated Seurat object individually
+  saveRDS(seurat_obj, file = file.path(results_dir, "qc_metadata_seurat_objects", paste0(condition, "_qc_metadata.rds")))
+}
+
+# Save the list of QCed Seurat objects with metadata for later use
+saveRDS(qc_seurat_list, file = file.path(results_dir, "qc_metadata_seurat_list.rds"))
+cat("QCed Seurat objects with metadata saved:", file.path(results_dir, "qc_metadata_seurat_list.rds"), "\n")
+```
+```{r}
+seurat_obj <- readRDS(file.path(results_dir, "qc_metadata_seurat_objects/1D-GFP_qc_metadata.rds"))
+str(seurat_obj)
+slotNames(seurat_obj)
+seurat_obj@meta.data
+```
+```{r}
+# Define directories and paths
+seurat_dir <- "/projectnb/farmer/akhila/Rabhi_Lab/scSPLiT-seq/final_results/qc_metadata_seurat_objects"
+new_seurat_dir <- file.path(results_dir, "gene_names_seurat_objects")
+
+# List all RDS files
+seurat_list <- readRDS(file = file.path(results_dir, "qc_metadata_seurat_list.rds"))
+
+# Function to load feature metadata
+load_feature_metadata <- function(condition) {
+  filtered_features_path <- file.path(filtered_samples_dir, paste0(condition, ".ScaleRNA.filtered.matrix/features.tsv"))
+  filtered_features <- read.table(filtered_features_path, header = FALSE, stringsAsFactors = FALSE, sep = "\t")
+  colnames(filtered_features) <- c("GeneID", "GeneName", "Type")
+  return(filtered_features)
+}
+
+# Process each Seurat object
+for (i in seq_along(conditions)) {
+  condition <- conditions[i]
+  seurat_obj <- seurat_list[[condition]]
+  
+  # Load feature metadata
+  feature_metadata <- load_feature_metadata(condition)
+  
+  # Ensure that the feature metadata matches the features in the Seurat object
+  feature_metadata <- feature_metadata[feature_metadata$GeneID %in% rownames(seurat_obj), ]
+  
+  # Create a dataframe for feature metadata
+  feature_metadata_df <- data.frame(
+    GeneID = feature_metadata$GeneID,
+    GeneName = feature_metadata$GeneName,
+    stringsAsFactors = FALSE
+  )
+  rownames(feature_metadata_df) <- feature_metadata$GeneID
+  
+  # Update the Seurat object's feature metadata
+  seurat_obj@assays$RNA@meta.features <- feature_metadata_df
+  
+  # Print the first few rows of the updated feature metadata for verification
+  head(seurat_obj@assays$RNA@meta.features)
+  
+  # Update the list with modified Seurat object
+  seurat_list[[condition]] <- seurat_obj
+    
+  # Save each updated Seurat object individually
+  saveRDS(seurat_obj, file = file.path(results_dir, "gene_names_seurat_objects", paste0(condition, "_gene_names.rds")))
+}
+
+# Save the list of Seurat objects with gene names for later use
+saveRDS(seurat_list, file = file.path(results_dir, "gene_names_seurat_list.rds"))
+cat("Seurat objects with gene names saved:", file.path(results_dir, "gene_names_seurat_list.rds"), "\n")
+```
+
+```{r}
+seurat_obj <- readRDS(file.path(results_dir, "gene_names_seurat_objects", "1D-mCherry_gene_names.rds"))
+str(seurat_obj)
+slotNames(seurat_obj)
+seurat_obj[["RNA"]]@meta.features
+# Example for a single Seurat object
+if (!is.null(seurat_obj@assays$RNA@counts)) {
+  cat("Counts slot is present.\n")
+} else {
+  cat("Counts slot is missing.\n")
+}
+Assays(seurat_obj)
+
+counts_data <- GetAssayData(seurat_obj, slot = "counts")
+summary(counts_data)
+
+```
+
+--------------------------------------------------------------------------------
+3. Data Integration
+--------------------------------------------------------------------------------
+```{r}
+# Load the list of QCed Seurat objects with metadata
+seurat_list <- readRDS(file.path(results_dir, "gene_names_seurat_list.rds"))
+
+cat("Loaded gene names Seurat objects with metadata from:", file.path(results_dir, "gene_names_seurat_list.rds"), "\n")
+
+# Separate mCherry and GFP datasets from qc_seurat_list_with_metadata
+mCherry_samples <- seurat_list[grep("mCherry", names(seurat_list))]
+GFP_samples <- seurat_list[grep("GFP", names(seurat_list))]
+
+# Normalize data and identify variable features for each Seurat object in mCherry dataset
+mCherry_samples <- lapply(mCherry_samples, function(seurat_obj) {
+  DefaultAssay(seurat_obj) <- "RNA"
+  Idents(seurat_obj) <- seurat_obj$orig.ident
+  seurat_obj <- NormalizeData(seurat_obj)
+  seurat_obj <- FindVariableFeatures(seurat_obj, selection.method = "vst", nfeatures = 2000)
+  seurat_obj <- ScaleData(seurat_obj, verbose = FALSE)
+  seurat_obj <- RunPCA(seurat_obj,  do.print = TRUE, pcs.print = 1:20,
+                             genes.print = 10, npcs = 70)
+  return(seurat_obj)
+  
+})
+
+# Normalize data and identify variable features for each Seurat object in GFP dataset
+GFP_samples <- lapply(GFP_samples, function(seurat_obj) {
+  DefaultAssay(seurat_obj) <- "RNA"
+  Idents(seurat_obj) <- seurat_obj$orig.ident
+  seurat_obj <- NormalizeData(seurat_obj)
+  seurat_obj <- FindVariableFeatures(seurat_obj, selection.method = "vst", nfeatures = 2000)
+  seurat_obj <- ScaleData(seurat_obj, verbose = FALSE)
+  seurat_obj <- RunPCA(seurat_obj,  do.print = TRUE, pcs.print = 1:20,
+                             genes.print = 10, npcs = 70)
+  return(seurat_obj)
+})
+
+# Integration for mCherry dataset
+anchors_mCherry <- FindIntegrationAnchors(object.list = mCherry_samples, dims = 1:30)
+integrated_mCherry <- IntegrateData(anchorset = anchors_mCherry, dims = 1:30)
+
+# Scale the integrated data and run PCA
+integrated_mCherry <- ScaleData(integrated_mCherry, verbose = FALSE)
+integrated_mCherry <- RunPCA(integrated_mCherry, npcs = 70)
+
+# Save mCherry integrated dataset
+saveRDS(integrated_mCherry, file = file.path(results_dir, "mCherry_integrated.rds"))
+cat("mCherry integrated dataset saved:", file.path(results_dir, "mCherry_integrated.rds"), "\n")
+
+# Integration for GFP dataset
+anchors_GFP <- FindIntegrationAnchors(object.list = GFP_samples, dims = 1:30)
+integrated_GFP <- IntegrateData(anchorset = anchors_GFP, dims = 1:30)
+
+# Scale the integrated data and run PCA
+integrated_GFP <- ScaleData(integrated_GFP, verbose = FALSE)
+integrated_GFP <- RunPCA(integrated_GFP, npcs = 70)
+
+# Save GFP integrated dataset
+saveRDS(integrated_GFP, file = file.path(results_dir, "GFP_integrated.rds"))
+cat("GFP integrated dataset saved:", file.path(results_dir, "GFP_integrated.rds"), "\n")
+
+# Merge the integrated datasets
+integrated_data <- merge(integrated_mCherry, y = integrated_GFP)
+
+# Save merged integrated dataset
+saveRDS(integrated_data, file = file.path(results_dir, "integrated_GFP_mCherry.rds"))
+cat("Integrated and merged dataset saved:", file.path(results_dir, "integrated_GFP_mCherry.rds"), "\n")
+```
+
+```{r}
+seurat_obj <- readRDS(file.path(results_dir, "integrated_GFP_mCherry.rds"))
+str(seurat_obj)
+
+seurat_obj[["RNA"]]@meta.features
+# Example for a single Seurat object
+if (!is.null(seurat_obj@assays$RNA@counts)) {
+  cat("Counts slot is present.\n")
+} else {
+  cat("Counts slot is missing.\n")
+}
+Assays(seurat_obj)
+
+counts_data <- GetAssayData(seurat_obj, slot = "counts")
+summary(counts_data)
+
+
+# Check the counts matrix in the RNA assay
+rna_counts <- GetAssayData(seurat_obj, slot = "counts", assay = "RNA")
+cat("RNA counts matrix:", sum(rna_counts != 0), "non-zero entries\n")
+
+# Check the counts matrix in the integrated assay
+integrated_counts <- GetAssayData(seurat_obj, slot = "counts", assay = "integrated")
+cat("Integrated counts matrix:", sum(integrated_counts != 0), "non-zero entries\n")
+
+rna_slots <- slotNames(seurat_obj@assays$RNA)
+print(rna_slots)
+
+# To check slots in the 'integrated' assay
+integrated_slots <- slotNames(seurat_obj@assays$integrated)
+print(integrated_slots)
+
+```
+
+
+```{r}
+# Read Seurat object
+seurat_obj <- readRDS(file.path(results_dir, "integrated_GFP_mCherry.rds"))
+
+# Load feature metadata (using one sample's features file)
+filtered_features_path <- file.path(filtered_samples_dir, paste0("1D-GFP", ".ScaleRNA.filtered.matrix/features.tsv"))
+feature_metadata <- read.table(filtered_features_path, header = FALSE, stringsAsFactors = FALSE, sep = "\t")
+colnames(feature_metadata) <- c("GeneID", "GeneName", "Type")
+
+# Ensure that the feature metadata matches the features in the Seurat object
+feature_metadata <- feature_metadata[feature_metadata$GeneID %in% rownames(seurat_obj), ]
+
+# Create a dataframe for feature metadata
+feature_metadata_df <- data.frame(
+  GeneID = feature_metadata$GeneID,
+  GeneName = feature_metadata$GeneName,
+  stringsAsFactors = FALSE
+)
+rownames(feature_metadata_df) <- feature_metadata$GeneID
+
+# Update the Seurat object's feature metadata
+seurat_obj@assays$RNA@meta.features <- feature_metadata_df
+seurat_obj@assays$integrated@meta.features <- feature_metadata_df
+
+# Print the first few rows of the updated feature metadata for verification
+head(seurat_obj@assays$RNA@meta.features)
+head(seurat_obj@assays$integrated@meta.features)
+
+# Check for missing Gene Names in the RNA assay
+missing_gene_names_RNA <- seurat_obj@assays$RNA@meta.features[is.na(seurat_obj@assays$RNA@meta.features$GeneName), ]
+
+# Check for missing Gene Names in the integrated assay
+missing_gene_names_integrated <- seurat_obj@assays$integrated@meta.features[is.na(seurat_obj@assays$integrated@meta.features$GeneName), ]
+
+# Print the number of missing Gene Names
+cat("Number of missing Gene Names in RNA assay:", nrow(missing_gene_names_RNA), "\n")
+cat("Number of missing Gene Names in integrated assay:", nrow(missing_gene_names_integrated), "\n")
+
+# Save updated Seurat object 
+saveRDS(seurat_obj, file = file.path(results_dir, "integrated_gene_names_GFP_mCherry.rds"))
+
+cat("Seurat object with gene names saved:", file.path(results_dir, "integrated_gene_names_GFP_mCherry.rds"), "\n")
+
+```
+
+```{r}
+# Load the merged integrated dataset
+seurat_obj <- readRDS(file.path(results_dir, "integrated_gene_names_GFP_mCherry.rds"))
+DefaultAssay(seurat_obj) <- "RNA"
+cat("Loaded integrated dataset from:", file.path(results_dir, "integrated_gene_names_GFP_mCherry"), "\n")
+
+# Normalize the data
+seurat_obj <- NormalizeData(seurat_obj)
+
+# Find variable features and plot top 5 variable features
+seurat_obj <- FindVariableFeatures(seurat_obj, selection.method = "vst", nfeatures = 2000)
+top5 <- head(VariableFeatures(seurat_obj))
+plot1 <- VariableFeaturePlot(seurat_obj)
+LabelPoints(plot = plot1, points = top5, repel = TRUE)
+
+# Scale the data
+seurat_obj <- ScaleData(seurat_obj, verbose = FALSE)
+
+# Run PCA
+seurat_obj <- RunPCA(seurat_obj, npcs = 70)
+
+# Save the elbow plot
+pdf(file = file.path(results_dir, "Elbow_Plot.pdf"), width = 10, height = 8)
+ElbowPlot(seurat_obj, ndims = 70)
+dev.off()
+
+# Visualize PCA
+pca_plot <- DimPlot(seurat_obj, reduction = "pca", group.by = "orig.ident", label = TRUE, repel = TRUE) + 
+  ggtitle("PCA of Integrated Data")
+
+# Save the PCA plot
+pdf(file = file.path(results_dir, "PCA_Plot.pdf"), width = 10, height = 8)
+print(pca_plot)
+dev.off()
+
+# Save the PCA results
+saveRDS(seurat_obj, file = file.path(results_dir, "integrated_pca.rds"))
+cat("Integrated dataset with PCA saved:", file.path(results_dir, "integrated_pca.rds"), "\n")
+
+```
+
+
+--------------------------------------------------------------------------------
+4. UMAP and TSNE dimensional reduction for visualization
+--------------------------------------------------------------------------------
+```{r}
+seurat_obj <- readRDS(file.path(results_dir, "integrated_pca.rds"))
+
+# Run UMAP and TSNE with the determined optimal number of PCs
+seurat_obj <- RunUMAP(seurat_obj, reduction = "pca", dims = 1:15)
+seurat_obj <- RunTSNE(seurat_obj, check_duplicates = FALSE, dims = 1:15)
+
+# Save Seurat object
+saveRDS(seurat_obj, file = file.path(results_dir, "integrated_pca_umap_tsne.rds"))
+cat("Integrated dataset with UMAP and t-SNE saved:", file.path(results_dir, "integrated_pca_umap_tsne.rds"), "\n")
+
+```
+
+
+--------------------------------------------------------------------------------
+5. Find Clusters and Visualize 
+--------------------------------------------------------------------------------
+```{r}
+library(ggplot2, quietly = TRUE)
+seurat_obj <- readRDS(file.path(results_dir, "integrated_pca_umap_tsne.rds"))
+
+# Find neighbors and clusters
+seurat_obj <- FindNeighbors(seurat_obj, dims = 1:15)
+
+# Re-cluster at a resolution of 0.2, 0.3, 0.4, 0.5, 0.7, 0.8
+# 2nd pass: Re-cluster at resolutions in between 0.2 and 0.3
+seurat_obj <- FindClusters(seurat_obj, resolution = 0.2)
+# seurat_obj <- FindClusters(seurat_obj, resolution = 0.23)
+# seurat_obj <- FindClusters(seurat_obj, resolution = 0.24)
+# seurat_obj <- FindClusters(seurat_obj, resolution = 0.25)
+# seurat_obj <- FindClusters(seurat_obj, resolution = 0.28)
+seurat_obj <- FindClusters(seurat_obj, resolution = 0.3)
+seurat_obj <- FindClusters(seurat_obj, resolution = 0.4)
+seurat_obj <- FindClusters(seurat_obj, resolution = 0.5)
+seurat_obj <- FindClusters(seurat_obj, resolution = 0.7)
+seurat_obj <- FindClusters(seurat_obj, resolution = 0.8)
+
+View(seurat_obj@meta.data)
+```
+
+```{r}
+remotes::install_github("thomasp85/patchwork")
+remotes::install_github("tidyverse/ggplot2", ref = remotes::github_pull("5592"))
+```
+
+```{r}
+# Function to reorder clusters for a given resolution
+reorder_clusters <- function(cluster_column) {
+  # Convert to character, then numeric if necessary
+  if (is.factor(cluster_column)) {
+    cluster_column <- as.numeric(as.character(cluster_column))
+  }
+  
+  # Order unique clusters numerically
+  ordered_clusters <- sort(unique(cluster_column))
+  
+  # Convert to factor with sorted levels
+  return(factor(cluster_column, levels = ordered_clusters))
+}
+
+# Apply the function to all relevant clustering resolutions
+seurat_obj@meta.data$RNA_snn_res.0.2 <- reorder_clusters(seurat_obj@meta.data$RNA_snn_res.0.2)
+# seurat_obj@meta.data$RNA_snn_res.0.23 <- reorder_clusters(seurat_obj@meta.data$RNA_snn_res.0.23)
+# seurat_obj@meta.data$RNA_snn_res.0.24 <- reorder_clusters(seurat_obj@meta.data$RNA_snn_res.0.24)
+# seurat_obj@meta.data$RNA_snn_res.0.25 <- reorder_clusters(seurat_obj@meta.data$RNA_snn_res.0.25)
+# seurat_obj@meta.data$RNA_snn_res.0.28 <- reorder_clusters(seurat_obj@meta.data$RNA_snn_res.0.28)
+seurat_obj@meta.data$RNA_snn_res.0.3 <- reorder_clusters(seurat_obj@meta.data$RNA_snn_res.0.3)
+seurat_obj@meta.data$RNA_snn_res.0.4 <- reorder_clusters(seurat_obj@meta.data$RNA_snn_res.0.4)
+seurat_obj@meta.data$RNA_snn_res.0.5 <- reorder_clusters(seurat_obj@meta.data$RNA_snn_res.0.5)
+seurat_obj@meta.data$RNA_snn_res.0.7 <- reorder_clusters(seurat_obj@meta.data$RNA_snn_res.0.7)
+seurat_obj@meta.data$RNA_snn_res.0.8 <- reorder_clusters(seurat_obj@meta.data$RNA_snn_res.0.8)
+```
+
+```{r}
+# Requires patchwork to work
+DimPlot(seurat_obj, group.by = "RNA_snn_res.0.2", label = TRUE)
+# DimPlot(seurat_obj, group.by = "RNA_snn_res.0.23", label = TRUE)
+# DimPlot(seurat_obj, group.by = "RNA_snn_res.0.24", label = TRUE)
+# DimPlot(seurat_obj, group.by = "RNA_snn_res.0.25", label = TRUE)
+# DimPlot(seurat_obj, group.by = "RNA_snn_res.0.28", label = TRUE)
+DimPlot(seurat_obj, group.by = "RNA_snn_res.0.3", label = TRUE)
+DimPlot(seurat_obj, group.by = "RNA_snn_res.0.4", label = TRUE)
+DimPlot(seurat_obj, group.by = "RNA_snn_res.0.5", label = TRUE)
+DimPlot(seurat_obj, group.by = "RNA_snn_res.0.7", label = TRUE)
+DimPlot(seurat_obj, group.by = "RNA_snn_res.0.8", label = TRUE)
+
+saveRDS(seurat_obj, file = file.path(results_dir, "integrated_with_clusters_.rds"))
+```
+
+
+```{r}
+seurat_obj <- readRDS(file.path(results_dir, "integrated_with_clusters.rds"))
+# seurat_obj <- readRDS(file.path(results_dir, "integrated_with_clusters_res_0.2_to_0.4.rds"))
+
+# Create the clustree plot
+pdf(file = file.path(results_dir, "	clustree_res _0.2_to_0.8.pdf"), width = 10, height = 7)
+clustree(seurat_obj) 
+dev.off()
+```
+
+```{r}
+Mycolors <- c(
+  "#e6194B", "#3cb44b", "#ffe119", "#4363d8", "#f58231", "#911eb4", "#46f0f0",
+  "#f032e6", "#bcf60c", "#fabebe", "#008080", "#e6beff", "#9A6324", "#f0946d",
+  "#800000", "#aaffc3", "#808000", "#ffd8b1", "#000075", "#808080", "#004d44",
+  "#4d4400", "#2a034d", "#eb4783", "#294f0b", "#9a6e61", "#b5b7b8", "#3e7b91",
+  "#f03242", "#42d4f4"  # Additional colors added
+)
+
+
+# Define resolutions
+resolutions <- c("0.2", "0.3", "0.4", "0.5",  "0.7", "0.8")
+
+# Visualize clusters for each resolution
+for (res in resolutions) {
+  pdf(file.path(results_dir, "cluster_UMAPs_and_TSNEs", paste0("Clusters_TSNE_res_", res, ".pdf")), width = 5, height = 4)
+  print(DimPlot(seurat_obj, reduction = "tsne", cols = c(Mycolors), group.by = paste0("RNA_snn_res.", res)) + ggtitle(paste("Resolution:", res)))
+  dev.off()
+}
+
+# Visualize clusters for each resolution
+for (res in resolutions) {
+  pdf(file.path(results_dir, "cluster_UMAPs_and_TSNEs", paste0("Clusters_TSNE_Split.res_", res, ".pdf")), width = 32, height = 4)
+  print(DimPlot(seurat_obj, reduction = "tsne", split.by = "orig.ident", cols = c(Mycolors), group.by = paste0("RNA_snn_res.", res)) + ggtitle(paste("Resolution:", res)))
+  dev.off()
+}
+
+# Visualize clusters for each resolution
+for (res in resolutions) {
+  pdf(file.path(results_dir, "cluster_UMAPs_and_TSNEs", paste0("Clusters_UMAP_res_", res, ".pdf")), width = 5, height = 4)
+  print(DimPlot(seurat_obj, reduction = "umap", cols = c(Mycolors), group.by = paste0("RNA_snn_res.", res)) + ggtitle(paste("Resolution:", res)))
+  dev.off()
+}
+
+# Visualize clusters for each resolution
+for (res in resolutions) {
+  pdf(file.path(results_dir, "cluster_UMAPs_and_TSNEs", paste0("Clusters_UMAP_Split.res_", res, ".pdf")), width = 32, height = 4)
+  print(DimPlot(seurat_obj, reduction = "umap", split.by = "orig.ident", cols = c(Mycolors), group.by = paste0("RNA_snn_res.", res)) + ggtitle(paste("Resolution:", res)))
+  dev.off()
+}
+
+# Visualize clusters for each resolution
+for (res in resolutions) {
+  pdf(file.path(results_dir, "cluster_UMAPs_and_TSNEs", paste0("Clusters_UMAP_Split_Day.res_", res, ".pdf")), width = 16, height = 4)
+  print(DimPlot(seurat_obj, reduction = "umap", split.by = "Day", cols = c(Mycolors), group.by = paste0("RNA_snn_res.", res)) + ggtitle(paste("Resolution:", res)))
+  dev.off()
+}
+
+# Visualize clusters for each resolution
+for (res in resolutions) {
+  pdf(file.path(results_dir, "cluster_UMAPs_and_TSNEs", paste0("Clusters_TSNE_Split_Day.res_", res, ".pdf")), width = 16, height = 4)
+  print(DimPlot(seurat_obj, reduction = "tsne", split.by = "Day", cols = c(Mycolors), group.by = paste0("RNA_snn_res.", res)) + ggtitle(paste("Resolution:", res)))
+  dev.off()
+}
+```
+
+```{r}
+#seurat_obj <- readRDS(file.path(results_dir, "integrated_with_clusters.rds"))
+slotNames(seurat_obj)
+# Get the default assay
+DefaultAssay(seurat_obj)
+summary(seurat_obj[["RNA"]]@counts)
+summary(seurat_obj[["integrated"]]@counts)
+summary(seurat_obj[["RNA"]]@scale.data)
+summary(seurat_obj[["integrated"]]@scale.data)
+```
+
+
+--------------------------------------------------------------------------------  
+5. Annotate and Find Cluster Markers 
+--------------------------------------------------------------------------------  
+```{r}
+seurat_obj <- readRDS(file.path(results_dir, "integrated_with_clusters.rds"))
+
+# Check available group.by options
+names(seurat_obj@meta.data)
+
+# Connect to AnnotationHub
+ah <- AnnotationHub()
+
+# Access the Ensembl database for organism
+ahDb <- query(ah, 
+              pattern = c("Mus musculus", "EnsDb"), 
+              ignore.case = TRUE)
+
+# Acquire the latest annotation files
+id <- ahDb %>%
+  mcols() %>%
+  rownames() %>%
+  tail(n = 1)
+
+# Download the appropriate Ensembldb database
+edb <- ah[[id]]
+
+# Extract gene-level information from database
+annotations <- genes(edb, 
+                     return.type = "data.frame") %>%
+  dplyr::select(gene_id, gene_name, seq_name, gene_biotype, description)
+
+# Check column names in annotations
+print(colnames(annotations))
+
+# Define resolutions
+resolutions <- c("RNA_snn_res.0.2", "RNA_snn_res.0.3", "RNA_snn_res.0.4", "RNA_snn_res.0.5", "RNA_snn_res.0.7", "RNA_snn_res.0.8")
+
+# Loop over each resolution
+for (res in resolutions) {
+  # Find markers using Seurat for the current resolution
+  markers <- FindAllMarkers(seurat_obj, 
+                            only.pos = TRUE, 
+                            min.pct = 0.25, 
+                            logfc.threshold = 0.25, 
+                            group.by = res)
+  # Check column names in markers
+  print(colnames(markers))
+
+  # Join the markers with the annotations
+  ann_markers <- inner_join(x = markers, 
+                            y = annotations[, c("gene_id", "gene_name", "description")],
+                            by = c("gene" = "gene_id")) %>%
+    unique()
+  head(ann_markers)
+  
+  # Reorder and arrange the columns
+  ann_markers <- ann_markers[ , c(6, 7, 2:4, 1, 5,8)] %>%
+    dplyr::arrange(cluster, p_val_adj)
+  
+  # Save the markers to a CSV file
+  output_path <- sprintf('/projectnb/farmer/akhila/Rabhi_Lab/scSPLiT-seq/final_results/Markers.Scale.res.%s.csv', res)
+  write.csv(ann_markers, output_path, row.names = TRUE)
+  
+  # Optional: print a message indicating progress
+  cat(sprintf("Markers for resolution %s saved to %s\n", res, output_path))
+}
+```
+
+```{r}
+seurat_obj <- readRDS(file.path(results_dir, "integrated_with_clusters.rds"))
+
+# Check available group.by options
+names(seurat_obj@meta.data)
+
+# Connect to AnnotationHub
+ah <- AnnotationHub()
+
+# Access the Ensembl database for organism
+ahDb <- query(ah, 
+              pattern = c("Mus musculus", "EnsDb"), 
+              ignore.case = TRUE)
+
+# Acquire the latest annotation files
+id <- ahDb %>%
+  mcols() %>%
+  rownames() %>%
+  tail(n = 1)
+
+# Download the appropriate Ensembldb database
+edb <- ah[[id]]
+
+# Extract gene-level information from database
+annotations <- genes(edb, 
+                     return.type = "data.frame") %>%
+  dplyr::select(gene_id, gene_name, seq_name, gene_biotype, description)
+
+# Check column names in annotations
+print(colnames(annotations))
+
+# Define resolutions
+resolutions <- c("RNA_snn_res.0.5",  "RNA_snn_res.0.7", "RNA_snn_res.0.8")
+#, "RNA_snn_res.0.3", "RNA_snn_res.0.4", "RNA_snn_res.0.5", "RNA_snn_res.0.7", "RNA_snn_res.0.8"
+# Loop over each resolution
+for (res in resolutions) {
+  # Find markers using Seurat for the current resolution
+  markers <- FindAllMarkers(seurat_obj, 
+                            only.pos = TRUE, 
+                            min.pct = 0.25, 
+                            logfc.threshold = 0.25, 
+                            group.by = res)
+  # Check column names in markers
+  print(colnames(markers))
+
+  # Join the markers with the annotations
+  ann_markers <- inner_join(x = markers, 
+                            y = annotations[, c("gene_id", "gene_name", "description")],
+                            by = c("gene" = "gene_id")) %>%
+    unique()
+  head(ann_markers)
+  
+  # Reorder and arrange the columns
+  ann_markers <- ann_markers[ , c(6, 7, 2:4, 1, 5,8)] %>%
+    dplyr::arrange(cluster, p_val_adj)
+  
+  # Save the markers to a CSV file
+  output_path <- sprintf('/projectnb/farmer/akhila/Rabhi_Lab/scSPLiT-seq/final_results/Markers.Scale.res.%s.csv', res)
+  write.csv(ann_markers, output_path, row.names = TRUE)
+  
+  # Optional: print a message indicating progress
+  cat(sprintf("Markers for resolution %s saved to %s\n", res, output_path))
+}
+```
+
+```{r}
+seurat_obj <- readRDS(file.path(results_dir, "integrated_with_clusters.rds"))
+seurat_obj[["RNA"]]@meta.features
+```
+
+```{r}
+# Read the Seurat object
+seurat_obj <- readRDS(file.path(results_dir, "integrated_with_clusters.rds"))
+
+# Read the markers CSV file
+markers <- read.csv(file.path(results_dir, "Markers.Scale.res.RNA_snn_res.0.3.csv"))
+unique(markers$cluster)
+
+# Extract gene IDs and gene names from the Seurat object's feature metadata
+gene_ids <- rownames(seurat_obj[["RNA"]]@meta.features)
+gene_names <- seurat_obj[["RNA"]]@meta.features$GeneName
+
+# Create a named vector for easy mapping of gene IDs to gene names
+gene_id_to_name <- setNames(gene_names, gene_ids)
+
+# Replace gene IDs with gene names in the markers dataframe
+markers$gene_name <- gene_id_to_name[markers$gene]
+
+# Ensure gene names in `markers` are available in the `scale.data`
+available_genes <- rownames(seurat_obj[["RNA"]]@scale.data)
+
+top5_filtered <- markers %>%
+    group_by(cluster) %>%
+    top_n(n = 5, wt = avg_log2FC) %>%
+    dplyr::filter(gene %in% available_genes | gene_name %in% available_genes)
+
+# Use gene names for plotting if they match the `scale.data` rownames
+top5_filtered <- top5_filtered %>%
+    mutate(gene_to_plot = ifelse(gene_name %in% available_genes, gene_name, gene))
+
+# Check if the filtered list has genes to plot
+print(top5_filtered)
+
+# Check unique clusters in the filtered markers
+unique_clusters_filtered <- unique(top5_filtered$cluster)
+print(unique_clusters_filtered)
+
+# Create a vector of clusters to include
+clusters_to_include <- unique_clusters_filtered
+
+# Make sure Seurat object has the 0.3 resolution clusters in metadata
+if(!"RNA_snn_res.0.3" %in% colnames(seurat_obj@meta.data)) {
+    stop("The metadata column for 0.3 resolution clusters is missing.")
+}
+
+# Set the active identity to the clustering resolution of interest
+Idents(seurat_obj) <- seurat_obj$RNA_snn_res.0.3
+
+# Subset Seurat object to include only clusters present in top5_filtered
+filtered_seurat_obj <- subset(seurat_obj, idents = clusters_to_include)
+
+# Ensure RNA_snn_res.0.3 column is a factor with the correct levels
+filtered_seurat_obj$RNA_snn_res.0.3 <- factor(filtered_seurat_obj$RNA_snn_res.0.3, levels = clusters_to_include)
+
+# Generate the heatmap using gene names
+heatmap <- DoHeatmap(filtered_seurat_obj, features = top5_filtered$gene_to_plot) + NoLegend()
+
+# Save the heatmap to a PDF
+pdf("/projectnb/farmer/akhila/Rabhi_Lab/scSPLiT-seq/final_results/top5_heatmap_res_0.3.pdf", width = 12, height = 10)
+print(heatmap)
+
+# Close the PDF device
+dev.off()
+
+```
+
+```{r}
+# Read the Seurat object
+seurat_obj <- readRDS(file.path(results_dir, "integrated_with_clusters.rds"))
+
+# Ensure that seurat_obj$RNA_snn_res.0.3 is a character vector
+# seurat_obj$RNA_snn_res.0.3 <- as.character(seurat_obj$RNA_snn_res.0.3)
+
+# Create a named vector for cluster annotations
+cluster_annotations <- c(
+  "0" = "APC1a",
+  "1" = "APC2b",
+  "2" = "PVM",
+  "3" = "APC3",
+  "4" = "DC",
+  "5" = "APC4",
+  "6" = "Activated macrophages",
+  "7" = "cDC1",
+  "8" = "Angiogenic Endothelial Cells",
+  "9" = "Marix progenitor cells",
+  "10" = "Smooth muscle cell progenitors",
+  "11" = "T Cells",
+  "12" = "Pericytes",
+  "13" = "B Cells",
+  "14" = "Proliferating immune cells",
+  "15" = "Epithelial progenitor cells",
+  "16" = "Proliferating APCs"
+)
+
+# Map annotations to the Seurat object metadata
+seurat_obj@meta.data$cluster_annotations <- cluster_annotations[seurat_obj$RNA_snn_res.0.3]
+
+# Verify the metadata to ensure it’s correctly added
+head(seurat_obj@meta.data)
+
+# Save updated seurat object
+saveRDS(seurat_obj, file = file.path(results_dir, "integrated_with_cluster_annotations.rds"))
+```
+
+
+```{r}
+seurat_obj <- readRDS(file.path(results_dir, "integrated_with_cluster_annotations.rds"))
+seurat_obj[["RNA"]]@meta.features
+seurat_obj@meta.data
+
+# Define your color palette
+Mycolors <- c(
+  "#e6194B", "#3cb44b", "#ffe119", "#4363d8", "#f58231", "#911eb4", "#46f0f0",
+  "#f032e6", "#bcf60c", "#fabebe", "#008080", "#e6beff", "#9A6324", "#f0946d",
+  "#800000", "#aaffc3", "#808000"
+)
+
+# Get the unique clusters from 'RNA_snn_res.0.3' and sort them numerically
+clusters_0.3 <- sort(as.numeric(unique(seurat_obj@meta.data$RNA_snn_res.0.3)))
+
+clusters_0.3
+
+# Ensure the colors are named by the sorted cluster numbers
+names(Mycolors) <- as.character(clusters_0.3)
+
+# Add the colors as a new column in the Seurat object's metadata
+seurat_obj@meta.data$cluster_colors <- Mycolors[seurat_obj@meta.data$RNA_snn_res.0.3]
+
+# Check the metadata to confirm the colors are assigned
+head(seurat_obj@meta.data)
+
+saveRDS(seurat_obj, file = file.path(results_dir, "integrated_with_annotations_and_colors.rds"))
+```
+
+
+```{r}
+# Load the Seurat object
+seurat_obj <- readRDS(file.path(results_dir, "integrated_with_annotations_and_colors.rds"))
+
+# Create a named vector for cluster annotations
+cluster_annotations <- c(
+  "0" = "APC1a",
+  "1" = "APC2b",
+  "2" = "PVM",
+  "3" = "APC3",
+  "4" = "DC",
+  "5" = "APC4",
+  "6" = "Activated macrophages",
+  "7" = "cDC1",
+  "8" = "Angiogenic Endothelial Cells",
+  "9" = "Marix progenitor cells",
+  "10" = "Smooth muscle cell progenitors",
+  "11" = "T Cells",
+  "12" = "Pericytes",
+  "13" = "B Cells",
+  "14" = "Proliferating immune cells",
+  "15" = "Epithelial progenitor cells",
+  "16" = "Proliferating APCs"
+)
+
+# Cluster markers we are interested in looking at
+clusters_markers <- list(
+  "0" = c("Pi16", "Sema3c", "Dpp4", "Smpd3"), 
+  "1" = c("Cd55", "Irak3", "Has1", "Ugdh"),
+  "2" = c("F13a1", "Mrc1", "Cd163", "Lyve1", "Folr2"),
+  "3" = c("Adam12", "Col4a1", "Bmper", "Gsn"),
+  "4" = c("Ccr7", "Fscn1", "Ly75", "Cd40", "Flt3", "Ccl22", "Ccl15"),
+  "5" = c("Gdf10", "F3", "Gas6", "Meox2"),
+  "6" = c("H2-Ab1", "Ccr2", "Csf2ra", "Ciita", "Nlrp3", "Mrtfa", "Lgal3", "Csf2rb", "Il1b"),
+  "7" = c("Wdfy4", "Clec9a", "Irf8", "Xcr1"),
+  "8" = c("Kdr", "Vegfc", "Fli1", "Myo10", "Myo1b", "Pecam1", "Epas1", "Fgd5", "Sorbs2", "Notch3", "Kit1"),
+  "9" = c("Apod", "Slit2", "Robo2", "Hmcn1", "Cdh11", "Thbs1", "Adamts2", "Adam12", "Lama2", "Lamb1", "Mmp3", "Mmp9", "Col15a1", "Col4a1", "Col4a2", "Col8a1"),
+  "10" = c("Acta2", "Mhy11", "Mylk", "Cnn1", "Tagln", "Prkg1", "Sox9", "Notch3"),
+  "11" = c("Skap1", "Itk", "Satb1", "Pepn22", "Il17r", "Ikzf1", "Bcl11b", "Themis"), 
+  "12" = c("Rgs5", "Acta2", "Myh11", "Notch3", "Gspg4", "Cd146", "Sorbs1", "Cald1", "Abcc9", "Pparg"),
+  "13" = c("Bank", "Bcl11a", "Ighm", "Mef2c"), 
+  "14" = c("Top2a", "Mki67", "Cenpe", "Cd74"),
+  "15" = c("Krt8", "Krt18", "Krt19", "Epcam", "Sox9", "Kit", "Erbb4b", "Gata3"),
+  "16" = c("Diaph3", "Top2a", "Mki67")
+)
+
+# Ensure identity classes are set for consistent plotting
+Idents(seurat_obj) <- "RNA_snn_res.0.3"
+
+Mycolors_ordered <- c(
+    "#008080", "#46f0f0", "#f0946d", "#f58231", "#fabebe", "#f032e6", "#ffe119", 
+    "#bcf60c", "#e6beff", "#9A6324", "#aaffc3", "#3cb44b", "#4363d8", "#911eb4",
+    "#800000", "#808000", "#e6194B"
+)
+
+# Define your color palette
+Mycolors <- c(
+  "#e6194B", "#3cb44b", "#ffe119", "#4363d8", "#f58231", "#911eb4", "#46f0f0",
+  "#f032e6", "#bcf60c", "#fabebe", "#008080", "#e6beff", "#9A6324", "#f0946d",
+  "#800000", "#aaffc3", "#808000"
+)
+
+# Access the RNA assay meta.features to get GeneName column
+meta_features <- seurat_obj[["RNA"]]@meta.features
+
+# Create a named vector to map Gene Names to Gene IDs from the meta.features
+gene_name_to_id <- setNames(rownames(meta_features), meta_features$GeneName)
+
+# Create a reverse mapping from Gene ID to Gene Name for use in plot titles
+gene_id_to_name <- setNames(meta_features$GeneName, rownames(meta_features))
+
+# Convert Gene Names in clusters_markers to Gene IDs using the meta.features
+clusters_markers_ids <- lapply(clusters_markers, function(genes) {
+  gene_ids <- gene_name_to_id[genes]
+  # Remove any NA values where GeneName is not found in meta.features
+  gene_ids <- gene_ids[!is.na(gene_ids)]
+  return(gene_ids)
+})
+
+# Ensure we're using the 0.3 clustering resolution
+Idents(seurat_obj) <- "cluster_annotations"
+
+# Loop through each cluster and plot Violin plots and Feature plots for each gene in a separate PDF
+for (cluster in names(clusters_markers_ids)) {
+  markers <- clusters_markers_ids[[cluster]]
+  
+  # Get the corresponding gene names for titles
+  gene_names <- gene_id_to_name[markers]
+  
+  # Get the cluster annotation for the current cluster
+  cluster_annotation <- cluster_annotations[cluster]
+  
+  # Loop through each marker (gene) and create a separate plot for each
+  for (i in seq_along(markers)) {
+    gene_id <- markers[i]
+    gene_name <- gene_names[i]
+    
+    # Generate and save Violin Plot for each gene
+    vln_plot <- VlnPlot(seurat_obj, features = gene_id, pt.size = 0, cols = Mycolors_ordered) + 
+      ggtitle(paste("Cluster", cluster, "(", cluster_annotation, "):", gene_name)) +
+      labs(x = paste("Cluster", cluster, "(", cluster_annotation, ")"), 
+           y = paste("Expression of", gene_name)) +
+      theme(
+        axis.text.x = element_text(size = 6),  # Adjust x-axis annotation font size
+        legend.text = element_text(size = 6),  # Adjust legend font size
+        legend.title = element_text(size = 8)  # Adjust legend title font size
+      )
+    ggsave(filename = file.path(results_dir, "cluster_violin_plots", paste0("VlnPlot_Cluster_", cluster, "_Gene_", gene_name, ".pdf")), 
+           plot = vln_plot, width = 8, height = 6)
+    
+    # Generate and save Feature Plot for each gene
+    feature_plot <- FeaturePlot(seurat_obj, features = gene_id) + 
+      ggtitle(paste("Cluster", cluster, "(", cluster_annotation, "):", gene_name)) +
+      labs(x = paste("Cluster", cluster, "(", cluster_annotation, ")"), 
+           y = paste("Expression of", gene_name)) +
+      theme(
+        axis.text.x = element_text(size = 6),  # Adjust x-axis annotation font size
+        legend.text = element_text(size = 6),  # Adjust legend font size
+        legend.title = element_text(size = 8)  # Adjust legend title font size
+      )
+    ggsave(filename = file.path(results_dir, "cluster_feature_plots", paste0("FeaturePlot_Cluster_", cluster, "_Gene_", gene_name, ".pdf")), 
+           plot = feature_plot, width = 8, height = 6)
+  }
+}
+
+```
+
+
+```{r}
+# Step 1: Connect to AnnotationHub and get gene annotations
+ah <- AnnotationHub()
+ahDb <- query(ah, pattern = c("Mus musculus", "EnsDb"), ignore.case = TRUE)
+
+# Get the latest annotation file
+id <- ahDb %>%
+  mcols() %>%
+  rownames() %>%
+  tail(n = 1)
+
+# Download the appropriate Ensembl database
+edb <- ah[[id]]
+
+# Extract gene-level information (gene_id, gene_name, description)
+annotations <- genes(edb, return.type = "data.frame") %>%
+  dplyr::select(gene_id, gene_name, description)
+
+# Preview the annotation data
+head(annotations)
+
+# Step 2: Find markers between clusters at resolution 0.3
+Idents(seurat_obj) <- "RNA_snn_res.0.3"
+
+# Example: Find markers for cluster 0 vs cluster 1
+markers_0_vs_1 <- FindMarkers(seurat_obj, ident.1 = 0, ident.2 = 1, 
+                              logfc.threshold = 0.25, min.pct = 0.25)
+
+# Repeat for other cluster comparisons (e.g., cluster 3 vs cluster 9, cluster 10 vs cluster 12)
+markers_3_vs_9 <- FindMarkers(seurat_obj, ident.1 = 3, ident.2 = 9, 
+                              logfc.threshold = 0.25, min.pct = 0.25)
+
+markers_10_vs_12 <- FindMarkers(seurat_obj, ident.1 = 10, ident.2 = 12, 
+                                logfc.threshold = 0.25, min.pct = 0.25)
+
+# Step 3: Join the markers with annotations and reorder columns
+
+# Function to join marker genes with annotations and reorder columns
+join_and_annotate <- function(markers, annotations) {
+  # Convert rownames to a column for merging
+  markers <- markers %>%
+    rownames_to_column("gene")
+  
+  # Join marker data with annotations
+  ann_markers <- inner_join(markers, 
+                            annotations[, c("gene_id", "gene_name", "description")], 
+                            by = c("gene" = "gene_id")) %>%
+    unique()
+  
+  # Reorder the columns: gene_name, description, avg_log2FC, pct.1, pct.2, gene_id, p_val, p_val_adj
+  ann_markers <- ann_markers %>%
+    dplyr::select(gene_name, description, avg_log2FC, pct.1, pct.2, gene, p_val, p_val_adj) %>%
+    arrange(p_val_adj)
+  
+  return(ann_markers)
+}
+
+# Step 4: Annotate markers for each cluster comparison
+
+# Annotate markers for cluster 0 vs 1
+ann_markers_0_vs_1 <- join_and_annotate(markers_0_vs_1, annotations)
+
+# Annotate markers for cluster 3 vs 9
+ann_markers_3_vs_9 <- join_and_annotate(markers_3_vs_9, annotations)
+
+# Annotate markers for cluster 10 vs 12
+ann_markers_10_vs_12 <- join_and_annotate(markers_10_vs_12, annotations)
+
+# Step 5: Save results to CSV files
+
+write.csv(ann_markers_0_vs_1, "/projectnb/farmer/akhila/Rabhi_Lab/scSPLiT-seq/final_results/markers_files/Markers.Scale.0.3_resolution.0.vs.1.csv", row.names = FALSE)
+write.csv(ann_markers_3_vs_9, "/projectnb/farmer/akhila/Rabhi_Lab/scSPLiT-seq/final_results/markers_files/Markers.Scale.0.3_resolution.3.vs.9.csv", row.names = FALSE)
+write.csv(ann_markers_10_vs_12, "/projectnb/farmer/akhila/Rabhi_Lab/scSPLiT-seq/final_results/markers_files/Markers.Scale.0.3_resolution.10.vs.12.csv", row.names = FALSE)
+
+# The annotated marker gene data for each comparison is now saved with gene names, descriptions, and marker stats.
+```
+```{r}
+# Load the Seurat object
+seurat_obj <- readRDS(file.path(results_dir, "integrated_with_annotations_and_colors.rds"))
+
+# Access the RNA assay meta.features to get the GeneName column
+meta_features <- seurat_obj[["RNA"]]@meta.features
+
+# Convert gene names to lowercase for case-insensitive matching
+meta_features$GeneName_upper <- toupper(meta_features$GeneName)
+
+# Create a named vector to map Gene Names to Gene IDs from the meta.features
+gene_name_to_id <- setNames(rownames(meta_features), meta_features$GeneName_upper)
+
+# Create a reverse mapping from Gene ID to Gene Name for use in plot titles
+gene_id_to_name <- setNames(meta_features$GeneName, rownames(meta_features))
+
+# List of clusters and their respective missing genes
+missing_genes <- list(
+  "0" = "Dpp4",
+  "2" = "Folr2",
+  "6" = "Csf2ra",
+  "10" = "Cnn1",
+  "12" = "Sorbs1",
+  "13" = c("Ighm", "Mef2c")
+)
+
+# Convert the genes in missing_genes to lowercase for comparison
+missing_genes_upper <- lapply(missing_genes, toupper)
+
+# Loop through each cluster and generate the plots
+for (cluster in names(missing_genes_upper)) {
+  genes <- missing_genes_upper[[cluster]]
+  
+  for (gene in genes) {
+    # Get the Ensembl ID for the lowercase gene
+    ensembl_id <- gene_name_to_id[gene]
+    
+    if (!is.na(ensembl_id)) {
+      message(paste("Generating plots for gene:", gene, "in cluster:", cluster))
+      
+      # Generate Violin Plot
+      vln_plot <- VlnPlot(seurat_obj, features = ensembl_id, pt.size = 0) +
+        ggtitle(paste("Cluster", cluster, ":", gene_id_to_name[ensembl_id])) +  # Use original gene name for plot title
+        labs(x = paste("Cluster", cluster), y = paste("Expression of", gene_id_to_name[ensembl_id])) +
+        theme(
+          axis.text.x = element_text(size = 6),
+          legend.text = element_text(size = 6),
+          legend.title = element_text(size = 8)
+        )
+      print(vln_plot)  # Show the violin plot
+      
+      # Save the violin plot
+      ggsave(filename = file.path(results_dir, "cluster_violin_plots", paste0("VlnPlot_Cluster_", cluster, "_Gene_", gene_id_to_name[ensembl_id], ".pdf")), 
+             plot = vln_plot, width = 8, height = 6)
+      
+      # Generate Feature Plot
+      feature_plot <- FeaturePlot(seurat_obj, features = ensembl_id) +
+        ggtitle(paste("Cluster", cluster, ":", gene_id_to_name[ensembl_id])) +  # Use original gene name for plot title
+        labs(x = "UMAP", y = paste("Expression of", gene_id_to_name[ensembl_id])) +
+        theme(
+          axis.text.x = element_text(size = 6),
+          legend.text = element_text(size = 6),
+          legend.title = element_text(size = 8)
+        )
+      print(feature_plot)  # Show the feature plot
+      
+      # Save the feature plot
+      ggsave(filename = file.path(results_dir, "cluster_feature_plots", paste0("FeaturePlot_Cluster_", cluster, "_Gene_", gene_id_to_name[ensembl_id], ".pdf")), 
+             plot = feature_plot, width = 8, height = 6)
+      
+    } else {
+      message(paste("Gene", gene, "not found in the metadata for cluster", cluster))
+    }
+  }
+}
+
+
+```
+
+```{r}
+#seurat_obj <- readRDS(file.path(results_dir, "integrated_with_clusters.rds"))
+markers <- read_csv('/projectnb/farmer/akhila/Rabhi_Lab/scSPLiT-seq/final_results/Markers.Scale.res.RNA_snn_res.0.3.csv')
+# Print column names to verify
+print(colnames(markers))
+markers <- markers %>%
+  dplyr::select(-...1)
+# Verify column names
+print(colnames(markers))
+
+# Print the first few rows
+head(markers)
+
+# Extract gene identifiers from markers
+marker_genes <- unique(markers$gene)
+
+# Extract gene identifiers from Seurat object
+seurat_genes <- rownames(seurat_obj)
+
+# Find genes in markers not present in Seurat object
+missing_genes <- setdiff(marker_genes, seurat_genes)
+print(missing_genes)
+
+
+
+```
+
+```{r}
+seurat_obj <- readRDS(file.path(results_dir, "integrated_with_annotations_and_colors.rds"))
+
+# Extract clustering information
+cell_clusters <- seurat_obj$RNA_snn_res.0.3
+cell_barcodes <- colnames(seurat_obj)
+
+## Create a data frame with cell barcodes, cluster numbers
+cluster_info <- data.frame(CellID = cell_barcodes, Cluster = cell_clusters)
+
+# Write the cluster_info data frame to a CSV file in the results directory
+write.csv(cluster_info, file.path(results_dir, "cluster_info.csv"), row.names = FALSE)
+```
+
